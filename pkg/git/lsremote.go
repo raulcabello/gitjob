@@ -1,12 +1,11 @@
 package git
 
 import (
-	"bufio"
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,11 +15,15 @@ import (
 	"strings"
 	"time"
 
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/pkg/errors"
 	"github.com/rancher/wrangler/pkg/randomtoken"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	corev1 "k8s.io/api/core/v1"
 	k8snet "k8s.io/apimachinery/pkg/util/net"
 )
@@ -55,6 +58,7 @@ func newGit(directory, url string, opts *options) (*git, error) {
 type git struct {
 	URL               string
 	Directory         string
+	username          string
 	password          string
 	agent             *agent.Agent
 	caBundle          []byte
@@ -79,18 +83,30 @@ func (g *git) lsRemote(branch string, commit string) (string, error) {
 		return commit, err
 	}
 
-	output := &bytes.Buffer{}
-	if err := g.gitCmd(output, "ls-remote", g.URL, formatRefForBranch(branch)); err != nil {
-		return "", err
+	refBranch := formatRefForBranch(branch)
+
+	rem := gogit.NewRemote(memory.NewStorage(), &config.RemoteConfig{
+		URLs: []string{g.URL},
+	})
+
+	// We can then use every Remote functions to retrieve wanted information
+	refs, err := rem.List(&gogit.ListOptions{Auth: &httpgit.BasicAuth{
+		Username: g.username,
+		Password: g.password,
+	}})
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	var lines []string
-	s := bufio.NewScanner(output)
-	for s.Scan() {
-		lines = append(lines, s.Text())
+	for _, ref := range refs {
+		if ref.Name().IsBranch() {
+			if ref.Name().String() == refBranch {
+				return ref.Hash().String(), nil
+			}
+		}
 	}
 
-	return firstField(lines, fmt.Sprintf("no commit for branch: %s", branch))
+	return "", errors.New("not found")
 }
 
 func (g *git) httpClientWithCreds() (*http.Client, error) {
@@ -204,8 +220,8 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 		if err != nil {
 			return err
 		}
-		u.User = url.User(string(username))
 		g.URL = u.String()
+		g.username = string(username)
 		g.password = string(password)
 	} else if cred.Type == corev1.SecretTypeSSHAuth {
 		key, err := ssh.ParseRawPrivateKey(cred.Data[corev1.SSHAuthPrivateKey])
@@ -226,6 +242,7 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 	return nil
 }
 
+/*
 func (g *git) gitCmd(output io.Writer, subCmd string, args ...string) error {
 	kv := fmt.Sprintf("credential.helper=%s", `/bin/sh -c 'echo "password=$GIT_PASSWORD"'`)
 	//nolint:gosec // this exec deals with user input:
@@ -294,6 +311,7 @@ func (g *git) gitCmd(output io.Writer, subCmd string, args ...string) error {
 	}
 	return nil
 }
+*/
 
 func (g *git) injectAgent(cmd *exec.Cmd) (io.Closer, error) {
 	r, err := randomtoken.Generate()
@@ -361,6 +379,7 @@ func formatGitURL(endpoint, branch string) string {
 	return ""
 }
 
+/*
 func firstField(lines []string, errText string) (string, error) {
 	if len(lines) == 0 {
 		return "", errors.New(errText)
@@ -376,7 +395,7 @@ func firstField(lines []string, errText string) (string, error) {
 	}
 
 	return fields[0], nil
-}
+}*/
 
 func formatRefForBranch(branch string) string {
 	return fmt.Sprintf("refs/heads/%s", branch)
