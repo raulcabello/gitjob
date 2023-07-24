@@ -10,11 +10,12 @@ replace (
 require (
 	github.com/Masterminds/semver/v3 v3.2.1
 	github.com/go-git/go-billy/v5 v5.4.1
-	github.com/go-git/go-git/v5 v5.7.0
+	github.com/go-git/go-git/v5 v5.8.0
 	github.com/gogits/go-gogs-client v0.0.0-20210131175652-1d7215cd8d85
 	github.com/gorilla/mux v1.8.0
 	github.com/onsi/ginkgo/v2 v2.11.0
 	github.com/onsi/gomega v1.27.8
+	github.com/otiai10/copy v1.12.0
 	github.com/pkg/errors v0.9.1
 	github.com/rancher/lasso v0.0.0-20230629200414-8a54b32e6792
 	github.com/rancher/steve v0.0.0-20230717160251-d040cffef385

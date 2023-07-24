@@ -214,7 +214,7 @@ func (g *Git) Create(repodir string, from string, subdir string) (*git.Repositor
 	}
 
 	if k != nil {
-		po.Auth = k
+		//	po.Auth = k
 	}
 
 	err = repo.Push(&po)

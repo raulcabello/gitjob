@@ -4,8 +4,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,7 +24,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	corev1 "k8s.io/api/core/v1"
 	k8snet "k8s.io/apimachinery/pkg/util/net"
 )
@@ -58,7 +58,7 @@ func newGit(directory, url string, opts *options) (*git, error) {
 type git struct {
 	URL               string
 	Directory         string
-	username          string
+	username          string //todo remove!
 	password          string
 	agent             *agent.Agent
 	caBundle          []byte
@@ -66,6 +66,7 @@ type git struct {
 	secret            *corev1.Secret
 	headers           map[string]string
 	knownHosts        []byte
+	auth              transport.AuthMethod
 }
 
 // LsRemote runs ls-remote on git repo and returns the HEAD commit SHA
@@ -78,24 +79,18 @@ func (g *git) lsRemote(branch string, commit string) (string, error) {
 			return "", err
 		}
 	}
-
 	if changed, err := g.remoteSHAChanged(branch, commit); err != nil || !changed {
 		return commit, err
 	}
 
 	refBranch := formatRefForBranch(branch)
-
 	rem := gogit.NewRemote(memory.NewStorage(), &config.RemoteConfig{
 		URLs: []string{g.URL},
 	})
 
-	// We can then use every Remote functions to retrieve wanted information
-	refs, err := rem.List(&gogit.ListOptions{Auth: &httpgit.BasicAuth{
-		Username: g.username,
-		Password: g.password,
-	}})
+	refs, err := rem.List(&gogit.ListOptions{Auth: g.auth})
 	if err != nil {
-		log.Fatal(err)
+		return "", err
 	}
 
 	for _, ref := range refs {
@@ -223,6 +218,10 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 		g.URL = u.String()
 		g.username = string(username)
 		g.password = string(password)
+		g.auth = &httpgit.BasicAuth{
+			Username: g.username,
+			Password: g.password,
+		}
 	} else if cred.Type == corev1.SecretTypeSSHAuth {
 		key, err := ssh.ParseRawPrivateKey(cred.Data[corev1.SSHAuthPrivateKey])
 		if err != nil {

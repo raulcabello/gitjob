@@ -29,6 +29,6 @@ jobs:
           go-version: ${{ env.SETUP_GO_VERSION }}
 
       - name: integration-test
-        run: go test ./integrationtests/...
+        run: go test -v ./integrationtests/...
         env:
           TESTCONTAINERS_RYUK_DISABLED: true
