@@ -160,75 +160,77 @@ func TestLatestCommit_BasicAuth(t *testing.T) {
 }
 
 func TestLatestCommitSSH(t *testing.T) {
-	/*	ctx := context.Background()
-		container, url, err := createGogsContainer(ctx, t.TempDir())
-		if err != nil {
-			t.Errorf("got error when none was expected: %v", err)
+	ctx := context.Background()
+	container, url, err := createGogsContainer(ctx, createTempFolder(t))
+	if err != nil {
+		t.Errorf("got error when none was expected: %v", err)
+	}
+	defer func() {
+		if err := container.Terminate(ctx); err != nil {
+			t.Fatalf("failed to terminate container: %s", err.Error())
 		}
-		defer func() {
-			if err := container.Terminate(ctx); err != nil {
-				t.Fatalf("failed to terminate container: %s", err.Error())
+	}()
+	publicKey, privateKey, err := makeSSHKeyPair()
+	err = addPublicKey(url, publicKey)
+	if err != nil {
+		t.Errorf("got error when none was expected: %v", err)
+	}
+	mappedPort, err := container.MappedPort(ctx, "22")
+	if err != nil {
+		t.Errorf("got error when none was expected: %v", err)
+	}
+
+	sshUrl := "ssh://git@localhost:" + mappedPort.Port() + "/test/"
+	tests := map[string]struct {
+		gitjob         *gitjobv1.GitJob
+		expectedCommit string
+		expectedErr    error
+	}{
+		"public repo": {
+			gitjob: &gitjobv1.GitJob{
+				Spec: gitjobv1.GitJobSpec{
+					Git: gitjobv1.GitInfo{
+						Repo:   sshUrl + "public-repo",
+						Branch: "master",
+					},
+				},
+			},
+			expectedCommit: latestCommitPublicRepo,
+			expectedErr:    nil,
+		},
+		"private repo": {
+			gitjob: &gitjobv1.GitJob{
+				Spec: gitjobv1.GitJobSpec{
+					Git: gitjobv1.GitInfo{
+						Repo:   sshUrl + "private-repo", //git@localhost:test/private-repo.git
+						Branch: "master",
+					},
+				},
+			},
+			expectedCommit: latestCommitPrivateRepo,
+			expectedErr:    nil,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			secret := &v1.Secret{
+				Data: map[string][]byte{
+					v1.SSHAuthPrivateKey: []byte(privateKey),
+					"known_hosts":        []byte("localhost " + publicKey),
+				},
+				Type: v1.SecretTypeSSHAuth,
 			}
-		}()
-		publicKey, privateKey, err := makeSSHKeyPair()
-		err = addPublicKey(url, publicKey)
-		if err != nil {
-			t.Errorf("got error when none was expected: %v", err)
-		}
-		mappedPort, err := container.MappedPort(ctx, "22")
-		if err != nil {
-			t.Errorf("got error when none was expected: %v", err)
-		}
-
-		sshUrl := "ssh://git@localhost:" + mappedPort.Port() + "/test/"
-		tests := map[string]struct {
-			gitjob         *gitjobv1.GitJob
-			expectedCommit string
-			expectedErr    error
-		}{
-			"public repo": {
-				gitjob: &gitjobv1.GitJob{
-					Spec: gitjobv1.GitJobSpec{
-						Git: gitjobv1.GitInfo{
-							Repo:   sshUrl + "public-repo",
-							Branch: "master",
-						},
-					},
-				},
-				expectedCommit: latestCommitPublicRepo,
-				expectedErr:    nil,
-			},
-			"private repo": {
-				gitjob: &gitjobv1.GitJob{
-					Spec: gitjobv1.GitJobSpec{
-						Git: gitjobv1.GitInfo{
-							Repo:   sshUrl + "private-repo", //git@localhost:test/private-repo.git
-							Branch: "master",
-						},
-					},
-				},
-				expectedCommit: latestCommitPrivateRepo,
-				expectedErr:    nil,
-			},
-		}
-
-		for name, test := range tests {
-			t.Run(name, func(t *testing.T) {
-				secret := &v1.Secret{
-					Data: map[string][]byte{v1.SSHAuthPrivateKey: []byte(privateKey)},
-					Type: v1.SecretTypeSSHAuth,
-				}
-				secretGetter := &secretGetterMock{secret: secret}
-				latestCommit, err := git.LatestCommit(test.gitjob, secretGetter)
-				if err != test.expectedErr {
-					t.Errorf("expecter error is: %v, but got %v", test.expectedErr, err)
-				}
-				if latestCommit != test.expectedCommit {
-					t.Errorf("latestCommit doesn't match. got %s, expected %s", latestCommit, test.expectedCommit)
-				}
-			})
-		}
-	*/
+			secretGetter := &secretGetterMock{secret: secret}
+			latestCommit, err := git.LatestCommit(test.gitjob, secretGetter)
+			if err != test.expectedErr {
+				t.Errorf("expecter error is: %v, but got %v", test.expectedErr, err)
+			}
+			if latestCommit != test.expectedCommit {
+				t.Errorf("latestCommit doesn't match. got %s, expected %s", latestCommit, test.expectedCommit)
+			}
+		})
+	}
 }
 
 func createGogsContainer(ctx context.Context, tmpDir string) (testcontainers.Container, string, error) {

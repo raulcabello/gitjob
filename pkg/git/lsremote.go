@@ -18,6 +18,7 @@ import (
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/pkg/errors"
 	"github.com/rancher/wrangler/pkg/randomtoken"
@@ -236,6 +237,12 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 		}
 		g.knownHosts = cred.Data["known_hosts"]
 		g.agent = &sshAgent
+		g.auth, err = gossh.NewPublicKeys("git", cred.Data[corev1.SSHAuthPrivateKey], "")
+		if err != nil {
+			return err
+		}
+		//TODO add known_host, stricthostkeychecking=accept-new in fleet docs!
+		g.auth.(*gossh.PublicKeys).HostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
 	return nil
