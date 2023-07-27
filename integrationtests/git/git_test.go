@@ -7,6 +7,11 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	cp "github.com/otiai10/copy"
 	"github.com/rancher/gitjob/integrationtests/git/util"
@@ -18,21 +23,19 @@ import (
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"os"
-	"reflect"
-	"strings"
-	"testing"
 )
 
+/*
+This tests uses gogs for testing the integration with a git server. Gogs container uses the data from assets/gitserver, which
+contains one user, one public repository, and another private repository. Initial commits and fingerprint are provided as consts.
+*/
 const (
 	latestCommitPublicRepo  = "8cd5ab9c851482ce13a544c91ee010f6fdc7cf3f"
 	latestCommitPrivateRepo = "417310891d63d3f3a478bd4c5013e2f532056e8e"
 	gogsFingerPrint         = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBpayjxZ7oeeMc6KjGM0VgFEE5GmN1H6RLquUENLcpGcKzrEtym48WmAnX9Xwdkg8eMUBgyYkZtZgR+eapf29fQ="
+	gogsUser                = "test"
+	gogsPass                = "pass"
 )
-
-/*
-These tests
-*/
 
 func TestLatestCommit_NoAuth(t *testing.T) {
 	ctx := context.Background()
@@ -138,7 +141,7 @@ func TestLatestCommit_BasicAuth(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			secret := &v1.Secret{
-				Data: map[string][]byte{v1.BasicAuthUsernameKey: []byte("test"), v1.BasicAuthPasswordKey: []byte("pass")}, //TODO const
+				Data: map[string][]byte{v1.BasicAuthUsernameKey: []byte(gogsUser), v1.BasicAuthPasswordKey: []byte(gogsPass)},
 				Type: v1.SecretTypeBasicAuth,
 			}
 			secretGetter := &secretGetterMock{secret: secret}
@@ -216,6 +219,19 @@ func TestLatestCommitSSH(t *testing.T) {
 				},
 			},
 			knownHosts:     nil,
+			expectedCommit: latestCommitPrivateRepo,
+			expectedErr:    nil,
+		},
+		"private repo with known host with a wrong host url": {
+			gitjob: &gitjobv1.GitJob{
+				Spec: gitjobv1.GitJobSpec{
+					Git: gitjobv1.GitInfo{
+						Repo:   "ssh://git@localhost:" + sshPort.Port() + "/test/" + "private-repo",
+						Branch: "master",
+					},
+				},
+			},
+			knownHosts:     []byte("doesntexits " + gogsFingerPrint),
 			expectedCommit: "",
 			expectedErr:    fmt.Errorf("ssh: handshake failed: knownhosts: key is unknown"),
 		},
@@ -306,6 +322,7 @@ func createTempFolder(t *testing.T) string {
 	return t.TempDir()
 }
 
+// createAndAddKeys creates a public private key pair. It adds the public key to gogs, and returns the private key.
 func createAndAddKeys(url string) (string, error) {
 	publicKey, privateKey, err := makeSSHKeyPair()
 	if err != nil {

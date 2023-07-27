@@ -4,8 +4,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/go-git/go-git/v5/plumbing/transport"
-	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,11 +12,13 @@ import (
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
+	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -52,8 +52,6 @@ func newGit(directory, url string, opts *options) (*git, error) {
 type git struct {
 	URL               string
 	Directory         string
-	username          string //todo remove!
-	password          string
 	caBundle          []byte
 	insecureTLSVerify bool
 	secret            *corev1.Secret
@@ -80,20 +78,22 @@ func (g *git) lsRemote(branch string, commit string) (string, error) {
 		URLs: []string{g.URL},
 	})
 
-	refs, err := rem.List(&gogit.ListOptions{Auth: g.auth})
+	refs, err := rem.List(&gogit.ListOptions{
+		Auth:            g.auth,
+		CABundle:        g.caBundle,
+		InsecureSkipTLS: g.insecureTLSVerify,
+	})
 	if err != nil {
 		return "", err
 	}
 
 	for _, ref := range refs {
-		if ref.Name().IsBranch() {
-			if ref.Name().String() == refBranch {
-				return ref.Hash().String(), nil
-			}
+		if ref.Name().IsBranch() && ref.Name().String() == refBranch {
+			return ref.Hash().String(), nil
 		}
 	}
 
-	return "", errors.New("not found")
+	return "", errors.New("commit not found")
 }
 
 func (g *git) httpClientWithCreds() (*http.Client, error) {
@@ -196,6 +196,10 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 	if cred == nil {
 		return nil
 	}
+	u, err := url.Parse(g.URL)
+	if err != nil {
+		return err
+	}
 
 	if cred.Type == corev1.SecretTypeBasicAuth {
 		username, password := cred.Data[corev1.BasicAuthUsernameKey], cred.Data[corev1.BasicAuthPasswordKey]
@@ -203,27 +207,22 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 			return nil
 		}
 
-		u, err := url.Parse(g.URL)
-		if err != nil {
-			return err
-		}
 		g.URL = u.String()
-		g.username = string(username)
-		g.password = string(password)
 		g.auth = &httpgit.BasicAuth{
-			Username: g.username,
-			Password: g.password,
+			Username: string(username),
+			Password: string(password),
 		}
 	} else if cred.Type == corev1.SecretTypeSSHAuth {
-		auth, err := gossh.NewPublicKeys("git", cred.Data[corev1.SSHAuthPrivateKey], "")
-		auth.HostKeyCallback, err = createKnownHosts(cred.Data["known_hosts"])
-		//	err = os.Setenv("SSH_KNOWN_HOSTS", f.Name()) //TODO check env var!
+		auth, err := gossh.NewPublicKeys(u.User.Username(), cred.Data[corev1.SSHAuthPrivateKey], "")
+		if cred.Data["known_hosts"] != nil {
+			auth.HostKeyCallback, err = createKnownHosts(cred.Data["known_hosts"])
+		} else {
+			auth.HostKeyCallback = ssh.InsecureIgnoreHostKey()
+		}
 		g.auth = auth
 		if err != nil {
 			return err
 		}
-		//TODO add known_host, stricthostkeychecking=accept-new in fleet docs!
-		//g.auth.(*gossh.PublicKeys).HostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
 	return nil
@@ -247,77 +246,6 @@ func createKnownHosts(knownHosts []byte) (ssh.HostKeyCallback, error) {
 	return gossh.NewKnownHostsCallback(f.Name())
 }
 
-/*
-func (g *git) gitCmd(output io.Writer, subCmd string, args ...string) error {
-	kv := fmt.Sprintf("credential.helper=%s", `/bin/sh -c 'echo "password=$GIT_PASSWORD"'`)
-	//nolint:gosec // this exec deals with user input:
-	// $GIT_PASSWORD, g.URL, branch, commit
-	// The args are validated before and the -- is used to help git
-	// distinguish between git options from other arguments.
-	cmd := exec.Command("git", append([]string{"-c", kv, subCmd, "--"}, args...)...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("GIT_PASSWORD=%s", g.password))
-	stderrBuf := &bytes.Buffer{}
-	cmd.Stderr = stderrBuf
-	cmd.Stdout = output
-
-	if g.agent != nil {
-		c, err := g.injectAgent(cmd)
-		if err != nil {
-			return err
-		}
-		defer c.Close()
-	}
-
-	if len(g.knownHosts) != 0 {
-		f, err := os.CreateTemp("", "known_hosts")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(f.Name())
-		defer f.Close()
-
-		if _, err := f.Write(g.knownHosts); err != nil {
-			return err
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("closing knownHosts file %s: %w", f.Name(), err)
-		}
-
-		cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND="+fmt.Sprintf("ssh -o UserKnownHostsFile=%s", f.Name()))
-	} else {
-		cmd.Env = append(cmd.Env, "GIT_SSH_COMMAND="+fmt.Sprintf("ssh -o StrictHostKeyChecking=accept-new"))
-	}
-	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
-
-	if g.insecureTLSVerify {
-		cmd.Env = append(cmd.Env, "GIT_SSL_NO_VERIFY=false")
-	}
-
-	if len(g.caBundle) > 0 {
-		f, err := os.CreateTemp("", "ca-pem-")
-		if err != nil {
-			return err
-		}
-		defer os.Remove(f.Name())
-		defer f.Close()
-
-		if _, err := f.Write(g.caBundle); err != nil {
-			return fmt.Errorf("writing cabundle to %s: %w", f.Name(), err)
-		}
-		if err := f.Close(); err != nil {
-			return fmt.Errorf("closing cabundle %s: %w", f.Name(), err)
-		}
-		cmd.Env = append(cmd.Env, "GIT_SSL_CAINFO="+f.Name())
-	}
-
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("git %s error: %w, detail: %v", strings.Join(args, " "), err, stderrBuf.String())
-	}
-	return nil
-}
-*/
-
 func formatGitURL(endpoint, branch string) string {
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -340,24 +268,6 @@ func formatGitURL(endpoint, branch string) string {
 
 	return ""
 }
-
-/*
-func firstField(lines []string, errText string) (string, error) {
-	if len(lines) == 0 {
-		return "", errors.New(errText)
-	}
-
-	fields := strings.Fields(lines[0])
-	if len(fields) == 0 {
-		return "", errors.New(errText)
-	}
-
-	if len(fields[0]) == 0 {
-		return "", errors.New(errText)
-	}
-
-	return fields[0], nil
-}*/
 
 func formatRefForBranch(branch string) string {
 	return fmt.Sprintf("refs/heads/%s", branch)
