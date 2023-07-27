@@ -1,32 +1,25 @@
 package integrationtests
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	cp "github.com/otiai10/copy"
-	"github.com/pkg/errors"
-	"github.com/rancher/gitjob/e2e/githelper"
+	"github.com/rancher/gitjob/integrationtests/git/util"
 	gitjobv1 "github.com/rancher/gitjob/pkg/apis/gitjob.cattle.io/v1"
 	"github.com/rancher/gitjob/pkg/git"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	"golang.org/x/crypto/ssh"
-	"io"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/json"
-	"net/http"
 	"os"
-	"path"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -34,6 +27,7 @@ import (
 const (
 	latestCommitPublicRepo  = "8cd5ab9c851482ce13a544c91ee010f6fdc7cf3f"
 	latestCommitPrivateRepo = "417310891d63d3f3a478bd4c5013e2f532056e8e"
+	gogsFingerPrint         = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBpayjxZ7oeeMc6KjGM0VgFEE5GmN1H6RLquUENLcpGcKzrEtym48WmAnX9Xwdkg8eMUBgyYkZtZgR+eapf29fQ="
 )
 
 /*
@@ -170,19 +164,19 @@ func TestLatestCommitSSH(t *testing.T) {
 			t.Fatalf("failed to terminate container: %s", err.Error())
 		}
 	}()
-	publicKey, privateKey, err := makeSSHKeyPair()
-	err = addPublicKey(url, publicKey)
+	privateKey, err := createAndAddKeys(url)
 	if err != nil {
 		t.Errorf("got error when none was expected: %v", err)
 	}
-	mappedPort, err := container.MappedPort(ctx, "22")
+	sshPort, err := container.MappedPort(ctx, "22")
 	if err != nil {
 		t.Errorf("got error when none was expected: %v", err)
 	}
+	gogsKnownHosts := []byte("[localhost]:" + sshPort.Port() + " " + gogsFingerPrint)
 
-	sshUrl := "ssh://git@localhost:" + mappedPort.Port() + "/test/"
 	tests := map[string]struct {
 		gitjob         *gitjobv1.GitJob
+		knownHosts     []byte
 		expectedCommit string
 		expectedErr    error
 	}{
@@ -190,25 +184,40 @@ func TestLatestCommitSSH(t *testing.T) {
 			gitjob: &gitjobv1.GitJob{
 				Spec: gitjobv1.GitJobSpec{
 					Git: gitjobv1.GitInfo{
-						Repo:   sshUrl + "public-repo",
+						Repo:   "ssh://git@localhost:" + sshPort.Port() + "/test/" + "public-repo",
 						Branch: "master",
 					},
 				},
 			},
+			knownHosts:     gogsKnownHosts,
 			expectedCommit: latestCommitPublicRepo,
 			expectedErr:    nil,
 		},
-		"private repo": {
+		"private repo with known hosts": {
 			gitjob: &gitjobv1.GitJob{
 				Spec: gitjobv1.GitJobSpec{
 					Git: gitjobv1.GitInfo{
-						Repo:   sshUrl + "private-repo", //git@localhost:test/private-repo.git
+						Repo:   "ssh://git@localhost:" + sshPort.Port() + "/test/" + "private-repo",
 						Branch: "master",
 					},
 				},
 			},
+			knownHosts:     gogsKnownHosts,
 			expectedCommit: latestCommitPrivateRepo,
 			expectedErr:    nil,
+		},
+		"private repo without known hosts": {
+			gitjob: &gitjobv1.GitJob{
+				Spec: gitjobv1.GitJobSpec{
+					Git: gitjobv1.GitInfo{
+						Repo:   "ssh://git@localhost:" + sshPort.Port() + "/test/" + "private-repo",
+						Branch: "master",
+					},
+				},
+			},
+			knownHosts:     nil,
+			expectedCommit: "",
+			expectedErr:    fmt.Errorf("ssh: handshake failed: knownhosts: key is unknown"),
 		},
 	}
 
@@ -217,15 +226,17 @@ func TestLatestCommitSSH(t *testing.T) {
 			secret := &v1.Secret{
 				Data: map[string][]byte{
 					v1.SSHAuthPrivateKey: []byte(privateKey),
-					"known_hosts":        []byte("localhost " + publicKey),
+					"known_hosts":        test.knownHosts,
 				},
 				Type: v1.SecretTypeSSHAuth,
 			}
 			secretGetter := &secretGetterMock{secret: secret}
 			latestCommit, err := git.LatestCommit(test.gitjob, secretGetter)
-			if err != test.expectedErr {
+
+			if !reflect.DeepEqual(err, test.expectedErr) {
 				t.Errorf("expecter error is: %v, but got %v", test.expectedErr, err)
 			}
+
 			if latestCommit != test.expectedCommit {
 				t.Errorf("latestCommit doesn't match. got %s, expected %s", latestCommit, test.expectedCommit)
 			}
@@ -234,12 +245,12 @@ func TestLatestCommitSSH(t *testing.T) {
 }
 
 func createGogsContainer(ctx context.Context, tmpDir string) (testcontainers.Container, string, error) {
-	err := cp.Copy("./assets/gitserver", tmpDir)
+	err := cp.Copy("../assets/gitserver", tmpDir)
 	if err != nil {
 		return nil, "", err
 	}
 	req := testcontainers.ContainerRequest{
-		Image:        "gogs/gogs:0.13", //TODO change!
+		Image:        "gogs/gogs:0.13",
 		ExposedPorts: []string{"3000/tcp", "22/tcp"},
 		WaitingFor:   wait.ForHTTP("/").WithPort("3000/tcp"),
 		Mounts: testcontainers.ContainerMounts{
@@ -280,75 +291,9 @@ func getUrl(ctx context.Context, container testcontainers.Container) (string, er
 	return url, nil
 }
 
-func addPublicKey(url string, publicKey string) error {
-	token, err := createGogsToken(url)
-	if err != nil {
-		return err
-	}
-	fmt.Println(token)
-	//Authorization: token
-	publicKeyUrl := url + "/api/v1/user/keys"
-	values := map[string]string{"title": "testKey", "key": publicKey}
-	jsonValue, _ := json.Marshal(values)
-	client := &http.Client{}
-
-	req, err := http.NewRequest(http.MethodPost, publicKeyUrl, bytes.NewBuffer(jsonValue))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "token "+token)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != 201 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return err
-		}
-		return errors.New(string(body))
-	}
-
-	return nil
-}
-
-func createGogsToken(url string) (string, error) {
-	tokenUrl := url + "/api/v1/users/test/tokens"
-	values := map[string]string{"name": "token"}
-	jsonValue, _ := json.Marshal(values)
-	client := &http.Client{}
-
-	req, err := http.NewRequest(http.MethodPost, tokenUrl, bytes.NewBuffer(jsonValue))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth("test", "pass") //move to const
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	tokenResponse := &tokenResponse{}
-	err = json.Unmarshal(body, tokenResponse)
-	if err != nil {
-		return "", err
-	}
-
-	return tokenResponse.Sha1, nil
-}
-
-type tokenResponse struct {
-	Name string `json:"name,omitempty"`
-	Sha1 string `json:"sha1,omitempty"`
-}
-
-// explain cannot clean up in gh actions
+// createTempFolder uses testing tempDir if running in local, which will cleanup the files at the end of the tests.
+// cleanup fails in github actions, that's why we use os.MkdirTemp instead. Container will be removed at the end in
+// github actions, so no resources are left orphaned.
 func createTempFolder(t *testing.T) string {
 	if os.Getenv("GITHUB_ACTIONS") == "true" {
 		tmp, err := os.MkdirTemp("", "gogs")
@@ -361,44 +306,42 @@ func createTempFolder(t *testing.T) string {
 	return t.TempDir()
 }
 
-func createRepoWithInitialCommit(url string) (string, error) {
-	/*err := os.Setenv("GIT_HTTP_USER", "fleet-ci")
+func createAndAddKeys(url string) (string, error) {
+	publicKey, privateKey, err := makeSSHKeyPair()
 	if err != nil {
 		return "", err
 	}
-	err = os.Setenv("GIT_HTTP_PASSWORD", "pass")
-	if err != nil {
-		return "", err
-	}*/
-	g := githelper.NewHTTP(url)
-	tmpdir, _ := os.MkdirTemp("", "fleet-")
-	repodir := path.Join(tmpdir, "repo")
-	c, err := g.Create(repodir, "gitrepo", "examples")
+	client, err := util.NewClient(url)
 	if err != nil {
 		return "", err
 	}
-	log, err := c.Log(&gogit.LogOptions{})
+	err = client.AddPublicKey(publicKey)
 	if err != nil {
 		return "", err
 	}
 
-	numCommits := 0
-	commitHash := ""
-	err = log.ForEach(func(commit *object.Commit) error {
-		commitHash = commit.Hash.String()
-		numCommits++
+	return privateKey, nil
+}
 
-		return nil
-	})
-
-	if numCommits != 1 {
-		return "", errors.Errorf("It should be just one commit, found %d commits", numCommits)
-	}
+func makeSSHKeyPair() (string, string, error) {
+	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return commitHash, nil
+	var privKeyBuf strings.Builder
+	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
+	if err := pem.Encode(&privKeyBuf, privateKeyPEM); err != nil {
+		return "", "", err
+	}
+	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return "", "", err
+	}
+	var pubKeyBuf strings.Builder
+	pubKeyBuf.Write(ssh.MarshalAuthorizedKey(pub))
+
+	return pubKeyBuf.String(), privKeyBuf.String(), nil
 }
 
 type secretGetterMock struct {
@@ -411,30 +354,4 @@ func (s *secretGetterMock) Get(string, string) (*v1.Secret, error) {
 		return nil, s.err
 	}
 	return s.secret, nil
-}
-
-func makeSSHKeyPair() (string, string, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 1024)
-	if err != nil {
-		return "", "", err
-	}
-
-	// generate and write private key as PEM
-	var privKeyBuf strings.Builder
-
-	privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
-	if err := pem.Encode(&privKeyBuf, privateKeyPEM); err != nil {
-		return "", "", err
-	}
-
-	// generate and write public key
-	pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return "", "", err
-	}
-
-	var pubKeyBuf strings.Builder
-	pubKeyBuf.Write(ssh.MarshalAuthorizedKey(pub))
-
-	return pubKeyBuf.String(), privKeyBuf.String(), nil
 }

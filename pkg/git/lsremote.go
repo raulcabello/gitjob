@@ -6,13 +6,9 @@ import (
 	"fmt"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	httpgit "gopkg.in/src-d/go-git.v4/plumbing/transport/http"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -21,12 +17,9 @@ import (
 	gossh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/pkg/errors"
-	"github.com/rancher/wrangler/pkg/randomtoken"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 	corev1 "k8s.io/api/core/v1"
-	k8snet "k8s.io/apimachinery/pkg/util/net"
 )
 
 type options struct {
@@ -61,12 +54,10 @@ type git struct {
 	Directory         string
 	username          string //todo remove!
 	password          string
-	agent             *agent.Agent
 	caBundle          []byte
 	insecureTLSVerify bool
 	secret            *corev1.Secret
 	headers           map[string]string
-	knownHosts        []byte
 	auth              transport.AuthMethod
 }
 
@@ -224,28 +215,36 @@ func (g *git) setCredential(cred *corev1.Secret) error {
 			Password: g.password,
 		}
 	} else if cred.Type == corev1.SecretTypeSSHAuth {
-		key, err := ssh.ParseRawPrivateKey(cred.Data[corev1.SSHAuthPrivateKey])
-		if err != nil {
-			return err
-		}
-		sshAgent := agent.NewKeyring()
-		err = sshAgent.Add(agent.AddedKey{
-			PrivateKey: key,
-		})
-		if err != nil {
-			return err
-		}
-		g.knownHosts = cred.Data["known_hosts"]
-		g.agent = &sshAgent
-		g.auth, err = gossh.NewPublicKeys("git", cred.Data[corev1.SSHAuthPrivateKey], "")
+		auth, err := gossh.NewPublicKeys("git", cred.Data[corev1.SSHAuthPrivateKey], "")
+		auth.HostKeyCallback, err = createKnownHosts(cred.Data["known_hosts"])
+		//	err = os.Setenv("SSH_KNOWN_HOSTS", f.Name()) //TODO check env var!
+		g.auth = auth
 		if err != nil {
 			return err
 		}
 		//TODO add known_host, stricthostkeychecking=accept-new in fleet docs!
-		g.auth.(*gossh.PublicKeys).HostKeyCallback = ssh.InsecureIgnoreHostKey()
+		//g.auth.(*gossh.PublicKeys).HostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
 	return nil
+}
+
+func createKnownHosts(knownHosts []byte) (ssh.HostKeyCallback, error) {
+	f, err := os.CreateTemp("", "known_hosts")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(f.Name())
+	defer f.Close()
+
+	if _, err := f.Write(knownHosts); err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("closing knownHosts file %s: %w", f.Name(), err)
+	}
+
+	return gossh.NewKnownHostsCallback(f.Name())
 }
 
 /*
@@ -318,49 +317,6 @@ func (g *git) gitCmd(output io.Writer, subCmd string, args ...string) error {
 	return nil
 }
 */
-
-func (g *git) injectAgent(cmd *exec.Cmd) (io.Closer, error) {
-	r, err := randomtoken.Generate()
-	if err != nil {
-		return nil, err
-	}
-
-	tmpDir, err := os.MkdirTemp("", "ssh-agent")
-	if err != nil {
-		return nil, err
-	}
-
-	addr := &net.UnixAddr{
-		Name: filepath.Join(tmpDir, r),
-		Net:  "unix",
-	}
-
-	l, err := net.ListenUnix(addr.Net, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	cmd.Env = append(cmd.Env, "SSH_AUTH_SOCK="+addr.Name)
-
-	go func() {
-		defer os.RemoveAll(tmpDir)
-		defer l.Close()
-		for {
-			conn, err := l.Accept()
-			if err != nil {
-				if !k8snet.IsProbableEOF(err) {
-					logrus.Errorf("failed to accept ssh-agent client connection: %v", err)
-				}
-				return
-			}
-			if err := agent.ServeAgent(*g.agent, conn); err != nil && err != io.EOF {
-				logrus.Errorf("failed to handle ssh-agent client connection: %v", err)
-			}
-		}
-	}()
-
-	return l, nil
-}
 
 func formatGitURL(endpoint, branch string) string {
 	u, err := url.Parse(endpoint)
